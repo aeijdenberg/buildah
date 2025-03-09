@@ -22,6 +22,7 @@ import (
 
 // configuration, including customizations made in containers.conf
 var needToShutdownStore = false
+var poststoreShutdownHandlers []func() error
 
 func getStore(c *cobra.Command) (storage.Store, error) {
 	if err := setXDGRuntimeDir(); err != nil {

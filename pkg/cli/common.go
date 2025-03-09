@@ -54,6 +54,7 @@ type BudResults struct {
 	AllPlatforms        bool
 	Annotation          []string
 	Authfile            string
+	BlobInfoCacheDir    string
 	BuildArg            []string
 	BuildArgFile        []string
 	BuildContext        []string
@@ -66,6 +67,7 @@ type BudResults struct {
 	CPPFlags            []string
 	DisableCompression  bool
 	DisableContentTrust bool
+	EphemeralDataDir    bool
 	IgnoreFile          string
 	File                []string
 	Format              string
@@ -221,6 +223,7 @@ func GetBudFlags(flags *BudResults) pflag.FlagSet {
 	fs.String("arch", runtime.GOARCH, "set the ARCH of the image to the provided value instead of the architecture of the host")
 	fs.StringArrayVar(&flags.Annotation, "annotation", []string{}, "set metadata for an image (default [])")
 	fs.StringVar(&flags.Authfile, "authfile", "", "path of the authentication file.")
+	fs.StringVar(&flags.BlobInfoCacheDir, "blob-info-cache-dir", "", "path to directory to use for image blob cache")
 	fs.StringArrayVar(&flags.OCIHooksDir, "hooks-dir", []string{}, "set the OCI hooks directory path (may be set multiple times)")
 	fs.StringArrayVar(&flags.BuildArg, "build-arg", []string{}, "`argument=value` to supply to the builder")
 	fs.StringArrayVar(&flags.BuildArgFile, "build-arg-file", []string{}, "`argfile.conf` containing lines of argument=value to supply to the builder")
@@ -237,6 +240,7 @@ func GetBudFlags(flags *BudResults) pflag.FlagSet {
 	fs.BoolVarP(&flags.DisableCompression, "disable-compression", "D", true, "don't compress layers by default")
 	fs.BoolVar(&flags.DisableContentTrust, "disable-content-trust", false, "this is a Docker specific option and is a NOOP")
 	fs.StringArrayVar(&flags.Envs, "env", []string{}, "set environment variable for the image")
+	fs.BoolVar(&flags.EphemeralDataDir, "ephemeral-data-dir", false, "do not use any cached images or signatures, cleanup downloaded assets after build")
 	fs.StringVar(&flags.From, "from", "", "image name used to replace the value in the first FROM instruction in the Containerfile")
 	fs.StringVar(&flags.IgnoreFile, "ignorefile", "", "path to an alternate .dockerignore file")
 	fs.StringSliceVarP(&flags.File, "file", "f", []string{}, "`pathname or URL` of a Dockerfile")
