@@ -457,7 +457,10 @@ func SystemContextFromFlagSet(flags *pflag.FlagSet, findFlagFunc func(name strin
 		ctx.ArchitectureChoice = arch
 		ctx.VariantChoice = variant
 	}
-
+	blobInfoCacheDir, err := flags.GetString("blob-info-cache-dir")
+	if err == nil && findFlagFunc("blob-info-cache-dir").Changed {
+		ctx.BlobInfoCacheDir = blobInfoCacheDir
+	}
 	ctx.BigFilesTemporaryDir = GetTempDir()
 	return ctx, nil
 }

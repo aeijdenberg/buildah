@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/containers/buildah/imagebuildah"
 	buildahcli "github.com/containers/buildah/pkg/cli"
@@ -71,6 +72,12 @@ func init() {
 }
 
 func buildCmd(c *cobra.Command, inputArgs []string, iopts buildahcli.BuildOptions) error {
+	if iopts.EphemeralDataDir {
+		if err := createEphemeralDataDir(c); err != nil {
+			return fmt.Errorf("error creating ephemeral dir: %w", err)
+		}
+	}
+
 	if c.Flag("logfile").Changed {
 		logfile, err := os.OpenFile(iopts.Logfile, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 		if err != nil {
@@ -102,4 +109,29 @@ func buildCmd(c *cobra.Command, inputArgs []string, iopts buildahcli.BuildOption
 		logrus.Debugf("manifest list id = %q, ref = %q", id, ref.String())
 	}
 	return err
+}
+
+func createEphemeralDataDir(c *cobra.Command) error {
+	if c.Flag("root").Changed || c.Flag("runroot").Changed || c.Flag("blob-info-cache-dir").Changed {
+		return fmt.Errorf("cannot request ephemeral data dir if root, runroot or blob-info-cache-dir flag is set")
+	}
+	td, err := os.MkdirTemp("", "bud")
+	if err != nil {
+		return fmt.Errorf("error creating ephemeral data directory: %w", err)
+	}
+	poststoreShutdownHandlers = append(poststoreShutdownHandlers, func() error {
+		logrus.Debugf("cleaning up ephemeral directory: %s", td)
+		return os.RemoveAll(td)
+	})
+	logrus.Debugf("created ephemeral directory: %s", td)
+	if err := c.Flags().Set("root", filepath.Join(td, "root")); err != nil {
+		return fmt.Errorf("error setting root: %w", err)
+	}
+	if err := c.Flags().Set("runroot", filepath.Join(td, "runroot")); err != nil {
+		return fmt.Errorf("error setting runroot: %w", err)
+	}
+	if err := c.Flags().Set("blob-info-cache-dir", filepath.Join(td, "cache")); err != nil {
+		return fmt.Errorf("error setting cache dir: %w", err)
+	}
+	return nil
 }

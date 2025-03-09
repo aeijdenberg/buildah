@@ -196,6 +196,14 @@ func shutdownStore(cmd *cobra.Command) error {
 			}
 		}
 	}
+	// these are called even if we never actually got to the store
+	// call in reverse order so that handlers added later are called first
+	for i := len(poststoreShutdownHandlers) - 1; i >= 0; i-- {
+		if err := poststoreShutdownHandlers[i](); err != nil {
+			return fmt.Errorf("error in post-shutdown store handler: %w", err)
+		}
+	}
+	poststoreShutdownHandlers = nil
 	return nil
 }
 
