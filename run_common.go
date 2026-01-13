@@ -1434,8 +1434,34 @@ func (b *Builder) setupMounts(mountPoint string, spec *specs.Spec, bundlePath st
 	}
 
 	// Some mounts require env vars to be set, do these here
-	spec.Process.Env = append(spec.Process.Env, mountArtifacts.SecretEnvVars...)
+	// First, add secret env vars, removing any existing vars with the same name to avoid duplicates
+	for _, secretEnv := range mountArtifacts.SecretEnvVars {
+		// Find the environment variable name (before the "=")
+		parts := strings.Split(secretEnv, "=")
+		if len(parts) == 0 {
+			continue
+		}
+		envName := parts[0]
+		// Remove any existing environment variable with this name
+		newEnv := make([]string, 0, len(spec.Process.Env))
+		for _, env := range spec.Process.Env {
+			if !strings.HasPrefix(env, envName+"=") {
+				newEnv = append(newEnv, env)
+			}
+		}
+		spec.Process.Env = newEnv
+		// Add the new secret environment variable
+		spec.Process.Env = append(spec.Process.Env, secretEnv)
+	}
 	if mountArtifacts.SSHAuthSock != "" {
+		// Remove any existing SSH_AUTH_SOCK variable and add the new one
+		newEnv := make([]string, 0, len(spec.Process.Env))
+		for _, env := range spec.Process.Env {
+			if !strings.HasPrefix(env, "SSH_AUTH_SOCK=") {
+				newEnv = append(newEnv, env)
+			}
+		}
+		spec.Process.Env = newEnv
 		spec.Process.Env = append(spec.Process.Env, "SSH_AUTH_SOCK="+mountArtifacts.SSHAuthSock)
 	}
 
