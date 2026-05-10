@@ -1433,36 +1433,33 @@ func (b *Builder) setupMounts(mountPoint string, spec *specs.Spec, bundlePath st
 		mounts = append(mounts, mount)
 	}
 
-	// Some mounts require env vars to be set, do these here
-	// First, add secret env vars, removing any existing vars with the same name to avoid duplicates
-	for _, secretEnv := range mountArtifacts.SecretEnvVars {
-		// Find the environment variable name (before the "=")
-		parts := strings.Split(secretEnv, "=")
-		if len(parts) == 0 {
-			continue
-		}
-		envName := parts[0]
-		// Remove any existing environment variable with this name
-		newEnv := make([]string, 0, len(spec.Process.Env))
-		for _, env := range spec.Process.Env {
-			if !strings.HasPrefix(env, envName+"=") {
-				newEnv = append(newEnv, env)
-			}
-		}
-		spec.Process.Env = newEnv
-		// Add the new secret environment variable
-		spec.Process.Env = append(spec.Process.Env, secretEnv)
-	}
+	// Append mount-derived env vars (secrets exposed via env=, and SSH_AUTH_SOCK)
+	// and ensure they take precedence over any same-named entry that may already
+	// be present from the image config or the build environment. Without this,
+	// behaviour with duplicate env entries depends on the OCI runtime, which
+	// can cause the user-supplied secret value to be silently shadowed.
+	extra := append([]string(nil), mountArtifacts.SecretEnvVars...)
 	if mountArtifacts.SSHAuthSock != "" {
-		// Remove any existing SSH_AUTH_SOCK variable and add the new one
-		newEnv := make([]string, 0, len(spec.Process.Env))
-		for _, env := range spec.Process.Env {
-			if !strings.HasPrefix(env, "SSH_AUTH_SOCK=") {
-				newEnv = append(newEnv, env)
+		extra = append(extra, "SSH_AUTH_SOCK="+mountArtifacts.SSHAuthSock)
+	}
+	if len(extra) > 0 {
+		override := make(map[string]struct{}, len(extra))
+		for _, e := range extra {
+			name, _, ok := strings.Cut(e, "=")
+			if !ok || name == "" {
+				continue
 			}
+			override[name] = struct{}{}
 		}
-		spec.Process.Env = newEnv
-		spec.Process.Env = append(spec.Process.Env, "SSH_AUTH_SOCK="+mountArtifacts.SSHAuthSock)
+		filtered := spec.Process.Env[:0]
+		for _, env := range spec.Process.Env {
+			name, _, _ := strings.Cut(env, "=")
+			if _, drop := override[name]; drop {
+				continue
+			}
+			filtered = append(filtered, env)
+		}
+		spec.Process.Env = append(filtered, extra...)
 	}
 
 	// Set the list in the spec.
@@ -1766,12 +1763,26 @@ func (b *Builder) getTmpfsMount(tokens []string, idMaps IDMaps, workDir string) 
 	return &volumes[0], nil
 }
 
-func (b *Builder) getSecretMount(tokens []string, secrets map[string]define.Secret, idMaps IDMaps, workdir string) (rv struct {
-	Mount       *specs.Mount // set if mount created
-	EnvFile     string       // set if caller mount created from temp created env file
-	EnvVariable string       // set if caller should add to env variable list
-}, retErr error,
-) {
+// secretMountResult is the outcome of resolving a --mount=type=secret token list.
+// Exactly one of Mount or EnvVariable is populated when the secret was found.
+type secretMountResult struct {
+	Mount       *specs.Mount // bind mount that exposes the secret as a file
+	EnvFile     string       // temp file backing Mount, must be cleaned up by caller
+	EnvVariable string       // "NAME=value" entry to append to the process env
+}
+
+func resolveSecretValue(s define.Secret) ([]byte, error) {
+	switch s.SourceType {
+	case "env":
+		return []byte(os.Getenv(s.Source)), nil
+	case "file":
+		return os.ReadFile(s.Source)
+	default:
+		return nil, errors.New("invalid secret type")
+	}
+}
+
+func (b *Builder) getSecretMount(tokens []string, secrets map[string]define.Secret, idMaps IDMaps, workdir string) (rv secretMountResult, retErr error) {
 	errInvalidSyntax := errors.New("secret should have syntax id=id[,target=path,required=bool,mode=uint,uid=uint,gid=uint,env=dstVarName")
 	if len(tokens) == 0 {
 		return rv, errInvalidSyntax
@@ -1842,7 +1853,7 @@ func (b *Builder) getSecretMount(tokens []string, secrets map[string]define.Secr
 		}
 		return rv, nil
 	}
-	data, err := secr.ResolveValue()
+	data, err := resolveSecretValue(secr)
 	if err != nil {
 		return rv, err
 	}
