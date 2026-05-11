@@ -9518,3 +9518,11 @@ _EOF
   # even though different secret was passed to each(baz vs boz), we expect the same result, ie should not affect build history
   diff "${outpath}.a" "${outpath}.b"
 }
+
+@test "secret-env-overrides-image-env" {
+  # The image declares FOO=fromimage. The secret mounted as env=FOO must win,
+  # regardless of how the OCI runtime handles duplicate env entries.
+  BAR=fromsecret run_buildah build --secret id=mysecret,env=BAR -f <(printf "FROM alpine\nENV FOO=fromimage\nRUN --mount=type=secret,id=mysecret,env=FOO,required sh -c 'echo \"got=\$FOO\"'")
+  expect_output --substring "got=fromsecret"
+  assert "$output" !~ "got=fromimage"
+}
