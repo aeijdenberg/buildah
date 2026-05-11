@@ -1433,8 +1433,30 @@ func (b *Builder) setupMounts(mountPoint string, spec *specs.Spec, bundlePath st
 		mounts = append(mounts, mount)
 	}
 
-	// Some mounts require env vars to be set, do these here
-	spec.Process.Env = append(spec.Process.Env, mountArtifacts.EnvVars...)
+	// Append env vars produced by mounts and ensure they take precedence over
+	// any same-named entry already present from the image config or the build
+	// environment. Without this, behaviour with duplicate env entries depends
+	// on the OCI runtime, which can cause the user-supplied value to be
+	// silently shadowed.
+	if len(mountArtifacts.EnvVars) > 0 {
+		override := make(map[string]struct{}, len(mountArtifacts.EnvVars))
+		for _, e := range mountArtifacts.EnvVars {
+			name, _, ok := strings.Cut(e, "=")
+			if !ok || name == "" {
+				continue
+			}
+			override[name] = struct{}{}
+		}
+		filtered := spec.Process.Env[:0]
+		for _, env := range spec.Process.Env {
+			name, _, _ := strings.Cut(env, "=")
+			if _, drop := override[name]; drop {
+				continue
+			}
+			filtered = append(filtered, env)
+		}
+		spec.Process.Env = append(filtered, mountArtifacts.EnvVars...)
+	}
 
 	// Set the list in the spec.
 	spec.Mounts = mounts
