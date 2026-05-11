@@ -142,7 +142,7 @@ _EOF
 }
 
 @test "bud and test --inherit-annotations" {
-  base=registry.fedoraproject.org/fedora-minimal
+  base=quay.io/libpod/testimage:20241011
   _prefetch $base
   target=exp
 
@@ -191,7 +191,7 @@ _EOF
 }
 
 @test "bud and test --inherit-annotations with --layers" {
-  base=registry.fedoraproject.org/fedora-minimal
+  base=quay.io/libpod/testimage:20241011
   _prefetch $base
   target=exp
 
@@ -303,12 +303,12 @@ EOF
       ;;
     --label=A=B)
       # Should have had the requested label set.
-      run jq -r '.OCIv1.config.Labels.["A"]' <<< "$output"
+      run jq -r '.OCIv1.config.Labels["A"]' <<< "$output"
       assert ${status} == 0
       assert "${output}" == B
       # Go back and check the base, as a control.
       run_buildah inspect -t image ${baseiid}
-      run jq '.OCIv1.config.Labels.["A"]' <<< "$output"
+      run jq '.OCIv1.config.Labels["A"]' <<< "$output"
       assert ${status} == 0
       assert "${output}" == null
       ;;
@@ -1329,12 +1329,16 @@ _EOF
 
 @test "build with add resolving to invalid HTTP status code" {
   _prefetch alpine
-  local contextdir=${TEST_SCRATCH_DIR}/bud/platform
+  local contextdir=${TEST_SCRATCH_DIR}/build-context
   mkdir -p $contextdir
+
+  local contentdir=${TEST_SCRATCH_DIR}/content
+  mkdir -p $contentdir
+  starthttpd $contentdir
 
   cat > $contextdir/Dockerfile << _EOF
 FROM alpine
-ADD https://google.com/test /
+ADD http://0.0.0.0:${HTTP_SERVER_PORT}/test /
 _EOF
 
   run_buildah 125 build $WITH_POLICY_JSON -t source -f $contextdir/Dockerfile
@@ -2187,16 +2191,22 @@ _EOF
 
 @test "bud with --layers and --no-cache flags" {
   _prefetch alpine
+
+  local contentdir=${TEST_SCRATCH_DIR}/content
+  mkdir -p $contentdir
+  echo somebody told me that this counts as a README file > ${contentdir}/README.md
+  starthttpd ${contentdir}
+
   local contextdir=${TEST_SCRATCH_DIR}/use-layers
   cp -a $BUDFILES/use-layers $contextdir
 
   # Run with --pull-always to have a regression test for
   # containers/podman/issues/10307.
-  run_buildah build --pull-always $WITH_POLICY_JSON --layers -t test1 $contextdir
+  run_buildah build --pull-always --build-arg=HTTP_SERVER_PORT=${HTTP_SERVER_PORT} $WITH_POLICY_JSON --layers -t test1 $contextdir
   run_buildah images -a
-  expect_line_count 8
+  expect_line_count 9
 
-  run_buildah build --pull-never $WITH_POLICY_JSON --layers -t test2 $contextdir
+  run_buildah build --pull-never --build-arg=HTTP_SERVER_PORT=${HTTP_SERVER_PORT} $WITH_POLICY_JSON --layers -t test2 $contextdir
   run_buildah images -a
   expect_line_count 10
   run_buildah inspect --format "{{index .Docker.ContainerConfig.Env 1}}" test1
@@ -2235,7 +2245,13 @@ _EOF
 
 @test "bud with no --layers comment" {
   _prefetch alpine
-  run_buildah build --pull-never $WITH_POLICY_JSON --layers=false --no-cache -t test $BUDFILES/use-layers
+
+  local contentdir=${TEST_SCRATCH_DIR}/content
+  mkdir -p $contentdir
+  echo i heard a rumor that this counts as a README file > ${contentdir}/README.md
+  starthttpd ${contentdir}
+
+  run_buildah build --pull-never --build-arg=HTTP_SERVER_PORT=${HTTP_SERVER_PORT} $WITH_POLICY_JSON --layers=false --no-cache -t test $BUDFILES/use-layers
   run_buildah images -a
   expect_line_count 3
   run_buildah inspect --format "{{index .Docker.History 2}}" test
@@ -2511,13 +2527,19 @@ _EOF
 
 @test "bud with --rm flag" {
   _prefetch alpine
-  run_buildah build $WITH_POLICY_JSON --layers -t test1 $BUDFILES/use-layers
+
+  local contentdir=${TEST_SCRATCH_DIR}/content
+  mkdir -p $contentdir
+  echo all the cool kids say this counts as a README file > ${contentdir}/README.md
+  starthttpd ${contentdir}
+
+  run_buildah build --build-arg=HTTP_SERVER_PORT=${HTTP_SERVER_PORT} $WITH_POLICY_JSON --layers -t test1 $BUDFILES/use-layers
   run_buildah containers
   expect_line_count 1
 
-  run_buildah build $WITH_POLICY_JSON --rm=false --layers -t test2 $BUDFILES/use-layers
+  run_buildah build --build-arg=HTTP_SERVER_PORT=${HTTP_SERVER_PORT} $WITH_POLICY_JSON --rm=false --layers -t test2 $BUDFILES/use-layers
   run_buildah containers
-  expect_line_count 7
+  expect_line_count 8
 }
 
 @test "bud with --force-rm flag" {
@@ -2733,11 +2755,8 @@ FROM alpine
 RUN echo 'hello'> hello
 _EOF
   run_buildah build --output type=tar,dest=$mytmpdir/rootfs.tar $WITH_POLICY_JSON -t test-bud -f $mytmpdir/Containerfile .
-  # explode tar
-  mkdir $mytmpdir/rootfs
-  tar -C $mytmpdir/rootfs -xvf $mytmpdir/rootfs.tar
-  ls $mytmpdir/rootfs
-  # exported rootfs must contain `hello` file which we created inside the image
+  # verify tar content
+  run tar -tf $mytmpdir/rootfs.tar
   expect_output --substring 'hello'
 }
 
@@ -2751,10 +2770,14 @@ RUN echo 'hello'> hello
 _EOF
   # Using buildah() defined in helpers.bash since run_buildah adds unwanted chars to tar created by pipe.
   buildah build $WITH_POLICY_JSON -o - -t test-bud -f $mytmpdir/Containerfile . > $mytmpdir/rootfs.tar
-  # explode tar
-  mkdir $mytmpdir/rootfs
-  tar -C $mytmpdir/rootfs -xvf $mytmpdir/rootfs.tar
-  ls $mytmpdir/rootfs/hello
+  # verify tar content
+  run tar -tf $mytmpdir/rootfs.tar
+  expect_output --substring 'hello'
+
+  # test with long syntax as well
+  buildah build $WITH_POLICY_JSON --output type=tar,dest=- -t test-bud -f $mytmpdir/Containerfile . > $mytmpdir/rootfs2.tar
+  run tar -tf $mytmpdir/rootfs2.tar
+  expect_output --substring 'hello'
 }
 
 @test "build with custom build output and output rootfs to tar with no additional step" {
@@ -2767,10 +2790,8 @@ _EOF
 FROM alpine
 _EOF
   run_buildah build --output type=tar,dest=$mytmpdir/rootfs.tar $WITH_POLICY_JSON -t test-bud -f $mytmpdir/Containerfile .
-  # explode tar
-  mkdir $mytmpdir/rootfs
-  tar -C $mytmpdir/rootfs -xvf $mytmpdir/rootfs.tar
-  run ls $mytmpdir/rootfs
+  # verify tar content
+  run tar -tf $mytmpdir/rootfs.tar
   # exported rootfs must contain `var`,`bin` directory which exists in alpine
   # so output of `ls $mytmpdir/rootfs` must contain following strings
   expect_output --substring 'var'
@@ -2785,6 +2806,8 @@ _EOF
 FROM alpine
 RUN echo 'hello'> hello
 _EOF
+  run_buildah 125 build --output type=tar $WITH_POLICY_JSON -t test-bud -f $mytmpdir/Containerfile .
+  expect_output --substring 'missing required key "dest"'
   run_buildah 125 build --output type=tar, $WITH_POLICY_JSON -t test-bud -f $mytmpdir/Containerfile .
   expect_output --substring 'invalid'
   run_buildah 125 build --output type=wrong,dest=hello $WITH_POLICY_JSON -t test-bud -f $mytmpdir/Containerfile .
@@ -2989,7 +3012,7 @@ _EOF
 }
 
 @test "bud and test --unsetlabel" {
-  base=registry.fedoraproject.org/fedora-minimal
+  base=quay.io/libpod/testimage:20241011
   _prefetch $base
   target=exp
 
@@ -3019,7 +3042,7 @@ _EOF
 }
 
 @test "bud and test --unsetannotation" {
-  base=registry.fedoraproject.org/fedora-minimal
+  base=quay.io/libpod/testimage:20241011
   _prefetch $base
   target=exp
 
@@ -3049,7 +3072,7 @@ _EOF
 }
 
 @test "bud and test --unsetannotation with --layers" {
-  base=registry.fedoraproject.org/fedora-minimal
+  base=quay.io/libpod/testimage:20241011
   _prefetch $base
   target=exp
 
@@ -3090,7 +3113,7 @@ _EOF
 }
 
 @test "bud and test --unsetannotation with only base image" {
-  base=registry.fedoraproject.org/fedora-minimal
+  base=quay.io/libpod/testimage:20241011
   _prefetch $base
   target=exp
 
@@ -3117,7 +3140,7 @@ _EOF
 }
 
 @test "bud and test inherit-labels" {
-  base=registry.fedoraproject.org/fedora-minimal
+  base=quay.io/libpod/testimage:20241011
   _prefetch $base
   _prefetch alpine
   run_buildah --version
@@ -3125,37 +3148,37 @@ _EOF
   buildah_version=${output_fields[2]}
   run_buildah build $WITH_POLICY_JSON -t exp -f $BUDFILES/base-with-labels/Containerfile
 
-  run_buildah inspect --format '{{ index .Docker.Config.Labels "license"}}' exp
-  expect_output "MIT" "license must be MIT from fedora base image"
-  run_buildah inspect --format '{{ index .Docker.Config.Labels "name"}}' exp
-  expect_output "fedora-minimal" "name must be fedora from base image"
+  run_buildah inspect --format '{{ index .Docker.Config.Labels "created_at"}}' exp
+  expect_output "2024-10-11T12:26:00Z" "created_at must be inherited from base image"
+  run_buildah inspect --format '{{ index .Docker.Config.Labels "created_by"}}' exp
+  expect_output "test/system/build-testimage" "created_by must be inherited from base image"
 
-  run_buildah build $WITH_POLICY_JSON --inherit-labels=false --label name=world -t exp -f $BUDFILES/base-with-labels/Containerfile
+  run_buildah build $WITH_POLICY_JSON --inherit-labels=false --label created_by=world -t exp -f $BUDFILES/base-with-labels/Containerfile
   # no labels should be inherited from base image, only the buildah version label
-  # and `hello=world` which we just added using cli flag
-  want_output='map["io.buildah.version":"'$buildah_version'" "name":"world"]'
+  # and `created_by=world` which we just added using cli flag
+  want_output='map["created_by":"world" "io.buildah.version":"'$buildah_version'"]'
   run_buildah inspect --format '{{printf "%q" .Docker.Config.Labels}}' exp
   expect_output "$want_output"
 
   # Try building another file with multiple layers
   run_buildah build $WITH_POLICY_JSON --iidfile ${TEST_SCRATCH_DIR}/id1 --layers -t exp -f $BUDFILES/base-with-labels/Containerfile.layer
-  run_buildah inspect --format '{{ index .Docker.Config.Labels "license"}}' exp
-  expect_output "MIT" "license must be MIT from fedora base image"
-  run_buildah inspect --format '{{ index .Docker.Config.Labels "name"}}' exp
-  expect_output "world" "name must be world from Containerfile"
+  run_buildah inspect --format '{{ index .Docker.Config.Labels "created_at"}}' exp
+  expect_output "2024-10-11T12:26:00Z" "created_at must be inherited from base image"
+  run_buildah inspect --format '{{ index .Docker.Config.Labels "created_by"}}' exp
+  expect_output "world" "created_by must be world from Containerfile"
 
   # Now build same file with  --inherit-labels=false and verify if we are not using the cache again.
   run_buildah build $WITH_POLICY_JSON --layers --inherit-labels=false --iidfile ${TEST_SCRATCH_DIR}/inherit_false_1 -t exp -f $BUDFILES/base-with-labels/Containerfile.layer
   # Should not contain `Using cache` at all since
   assert "$output" !~ "Using cache"
-  want_output='map["io.buildah.version":"'$buildah_version'" "name":"world"]'
+  want_output='map["created_by":"world" "io.buildah.version":"'$buildah_version'"]'
   run_buildah inspect --format '{{printf "%q" .Docker.Config.Labels}}' exp
   expect_output "$want_output"
 
   run_buildah build $WITH_POLICY_JSON --layers --inherit-labels=false --iidfile ${TEST_SCRATCH_DIR}/inherit_false_2 -t exp -f $BUDFILES/base-with-labels/Containerfile.layer
   # Should contain `Using cache`
   expect_output --substring " Using cache"
-  want_output='map["io.buildah.version":"'$buildah_version'" "name":"world"]'
+  want_output='map["created_by":"world" "io.buildah.version":"'$buildah_version'"]'
   run_buildah inspect --format '{{printf "%q" .Docker.Config.Labels}}' exp
   expect_output "$want_output"
   assert "$(cat ${TEST_SCRATCH_DIR}/inherit_false_1)" = "$(cat ${TEST_SCRATCH_DIR}/inherit_false_2)" "expected image ids to not change"
@@ -3163,10 +3186,10 @@ _EOF
   # Now build same file with  --inherit-labels=true and verify if using the cache
   run_buildah build $WITH_POLICY_JSON --iidfile ${TEST_SCRATCH_DIR}/id2 --layers --inherit-labels=true -t exp -f $BUDFILES/base-with-labels/Containerfile.layer
   expect_output --substring " Using cache"
-  run_buildah inspect --format '{{ index .Docker.Config.Labels "license"}}' exp
-  expect_output "MIT" "license must be MIT from fedora base image"
-  run_buildah inspect --format '{{ index .Docker.Config.Labels "name"}}' exp
-  expect_output "world" "name must be world from Containerfile"
+  run_buildah inspect --format '{{ index .Docker.Config.Labels "created_at"}}' exp
+  expect_output "2024-10-11T12:26:00Z" "created_at must be inherited from base image"
+  run_buildah inspect --format '{{ index .Docker.Config.Labels "created_by"}}' exp
+  expect_output "world" "created_by must be world from Containerfile"
   # Final image id should be exactly same as the one image which was built in the past.
   assert "$(cat ${TEST_SCRATCH_DIR}/id1)" = "$(cat ${TEST_SCRATCH_DIR}/id2)" "expected image ids to not change"
 
@@ -3178,13 +3201,13 @@ _EOF
 
   # Now build same file with  --inherit-labels=true and verify if target stage inherits labels from the base stage.
   run_buildah build $WITH_POLICY_JSON --iidfile ${TEST_SCRATCH_DIR}/id3 --layers --inherit-labels=true -t exp -f $BUDFILES/base-with-labels/Containerfile.multi-stage
-  want_output='map["io.buildah.version":"'$buildah_version'" "name":"world"]'
+  want_output='map["created_by":"world" "io.buildah.version":"'$buildah_version'"]'
   run_buildah inspect --format '{{printf "%q" .Docker.Config.Labels}}' exp
   expect_output "$want_output"
 
   # Rebuild again with layers should not build image again at all.
   run_buildah build $WITH_POLICY_JSON --iidfile ${TEST_SCRATCH_DIR}/id4 --layers --inherit-labels=true -t exp -f $BUDFILES/base-with-labels/Containerfile.multi-stage
-  want_output='map["io.buildah.version":"'$buildah_version'" "name":"world"]'
+  want_output='map["created_by":"world" "io.buildah.version":"'$buildah_version'"]'
   run_buildah inspect --format '{{printf "%q" .Docker.Config.Labels}}' exp
   expect_output "$want_output"
   assert "$(cat ${TEST_SCRATCH_DIR}/id3)" = "$(cat ${TEST_SCRATCH_DIR}/id4)" "expected image ids to not change"
@@ -3676,7 +3699,10 @@ function validate_instance_compression {
   _prefetch ubuntu
   target=ubuntu-image
   run_buildah build $WITH_POLICY_JSON -t ${target} -f $BUDFILES/shell/Dockerfile.build-shell-custom $BUDFILES/shell
-  expect_output --substring "SHELL is not supported for OCI image format, \[/bin/bash -c\] will be ignored."
+  expect_output --substring "SHELL=/bin/bash"
+
+  # should work, but should also emit warning that it won't be persisted into saved image
+  expect_output --substring "SHELL is not persisted in the OCI image format, \[/bin/bash -c\]"
 }
 
 @test "bud with symlinks" {
@@ -4041,14 +4067,17 @@ _EOF
 }
 
 @test "bud with preprocessor" {
-  _prefetch alpine
+  _prefetch busybox
   target=alpine-image
-  run_buildah build -q $WITH_POLICY_JSON -t ${target} -f Decomposed.in $BUDFILES/preprocess
+  starthttpd $BUDFILES/preprocess
+  run_buildah build --build-arg HTTP_SERVER_PORT=${HTTP_SERVER_PORT} --network=host $WITH_POLICY_JSON -t ${target} -f Decomposed.in $BUDFILES/preprocess
 }
 
 @test "bud with preprocessor error" {
+  _prefetch busybox
   target=alpine-image
-  run_buildah bud $WITH_POLICY_JSON -t ${target} -f Error.in $BUDFILES/preprocess
+  starthttpd $BUDFILES/preprocess
+  run_buildah bud --build-arg HTTP_SERVER_PORT=${HTTP_SERVER_PORT} --network=host $WITH_POLICY_JSON -t ${target} -f Error.in $BUDFILES/preprocess
   expect_output --substring "Ignoring <stdin>:5:2: error: #error"
 }
 
@@ -4809,9 +4838,10 @@ _EOF
 }
 
 @test "bud test RUN with a privileged command" {
-  _prefetch alpine
-  target=alpinepriv
-  run_buildah build $WITH_POLICY_JSON -t ${target} -f $BUDFILES/run-privd/Dockerfile $BUDFILES/run-privd
+  _prefetch busybox
+  target=busyboxpriv
+  starthttpd $BUDFILES/run-privd
+  run_buildah build --network=host --build-arg HTTP_SERVER_PORT=${HTTP_SERVER_PORT} $WITH_POLICY_JSON -t ${target} -f $BUDFILES/run-privd/Dockerfile $BUDFILES/run-privd
   expect_output --substring "[^:][^[:graph:]]COMMIT ${target}"
   run_buildah images -q
   expect_line_count 2
@@ -5665,6 +5695,10 @@ EOF
 }
 
 @test "bud cache add-copy-chown" {
+  contentdir=${TEST_SCRATCH_DIR}/content
+  mkdir -p ${contentdir}
+  echo sure, this counts as a readme file > ${TEST_SCRATCH_DIR}/content/README.md
+  starthttpd $contentdir
   # Build each variation of COPY (from context, from previous stage) and ADD (from context, not overriding an archive, URL) twice.
   # Each second build should produce an image with the same ID as the first build, because the cache matches, but they should
   # otherwise all be different.
@@ -5675,7 +5709,7 @@ EOF
       iidfile=${TEST_SCRATCH_DIR}/${action}${i}
       containerfile=Dockerfile.${action}$(((i-1) % 2 + 1))
 
-      run_buildah build --iidfile $iidfile --layers --quiet $WITH_POLICY_JSON -f $containerfile $BUDFILES/cache-chown
+      run_buildah build --build-arg=HTTP_SERVER_PORT=${HTTP_SERVER_PORT} --iidfile $iidfile --layers --quiet $WITH_POLICY_JSON -f $containerfile $BUDFILES/cache-chown
     done
   done
 
@@ -7914,34 +7948,38 @@ _EOF
 }
 
 @test "bud with ADD with git repository source" {
-  _prefetch alpine
+  _prefetch quay.io/hummingbird/git # any image with git preinstalled would do
+
+  local repodir=${TEST_SCRATCH_DIR}/repository
+  mkdir -p ${repodir}/podman.git
+  tar -C ${repodir}/podman.git -xz < ${TEST_SOURCES}/git-daemon/bare-podman-repo.tar.gz
+  starthttpd /git/=${repodir}:"git http-backend":GIT_HTTP_EXPORT_ALL=1:GIT_PROJECT_ROOT=${repodir} ${repodir}
 
   local contextdir=${TEST_SCRATCH_DIR}/add-git
   mkdir -p $contextdir
   cat > $contextdir/Dockerfile << _EOF
-FROM alpine
-RUN apk add git
-
-ADD https://github.com/containers/podman.git#v5.0 /podman-branch
-ADD https://github.com/containers/podman.git#v5.0.0 /podman-tag
+FROM quay.io/hummingbird/git
+USER 0:0
+ADD http://0.0.0.0:${HTTP_SERVER_PORT}/git/podman.git#v5.0 /podman-branch
+ADD http://0.0.0.0:${HTTP_SERVER_PORT}/git/podman.git#v5.0.0 /podman-tag
 _EOF
 
   run_buildah build -f $contextdir/Dockerfile -t git-image $contextdir
   run_buildah from --quiet $WITH_POLICY_JSON --name testctr git-image
 
-  run_buildah run testctr -- sh -c 'cd podman-branch && git rev-parse HEAD'
+  run_buildah run --network=host testctr -- sh -c 'git -C /podman-branch rev-parse HEAD'
   local_head_hash=$output
-  run_buildah run testctr -- sh -c 'cd podman-branch && git ls-remote origin v5.0 | cut -f1'
+  run_buildah run --network=host testctr -- sh -c 'git -C /podman-branch ls-remote origin v5.0 | cut -f1'
   assert "$output" = "$local_head_hash"
 
-  run_buildah run testctr -- sh -c 'cd podman-tag && git rev-parse HEAD'
+  run_buildah run --network=host testctr -- sh -c 'git -C /podman-tag rev-parse HEAD'
   local_head_hash=$output
-  run_buildah run testctr -- sh -c 'cd podman-tag && git ls-remote --tags origin v5.0.0^{} | cut -f1'
+  run_buildah run --network=host testctr -- sh -c 'git -C /podman-tag ls-remote --tags origin v5.0.0 | cut -f1'
   assert "$output" = "$local_head_hash"
 
   cat > $contextdir/Dockerfile << _EOF
 FROM scratch
-ADD https://github.com/containers/crun.git#nosuchbranch /src
+ADD http://0.0.0.0:${HTTP_SERVER_PORT}/git/podman.git#nosuchbranch /src
 _EOF
   run_buildah 125 build -f $contextdir/Dockerfile -t git-image $contextdir
   expect_output --substring "couldn't find remote ref nosuchbranch"
@@ -8751,22 +8789,26 @@ EOF
 
 @test "bud --link ADD with remote URL consistent diffID" {
   _prefetch alpine
+  local contentdir=${TEST_SCRATCH_DIR}/content
+  mkdir -p $contentdir
+  echo this is a readmin > ${contentdir}/README.md
+  starthttpd ${contentdir}
   local contextdir=${TEST_SCRATCH_DIR}/bud/link-url
   mkdir -p $contextdir
-  
+
   cat > $contextdir/Dockerfile << EOF
 FROM alpine
-ADD --link https://github.com/moby/moby/raw/master/README.md /README.md
+ADD --link http://0.0.0.0:${HTTP_SERVER_PORT}/README.md /README.md
 RUN echo "remote add complete" > /complete.txt
 RUN cat /README.md
 EOF
-  
+
   run_buildah build --no-cache --layers $WITH_POLICY_JSON -t oci:${TEST_SCRATCH_DIR}/oci-url1 $contextdir
   run_buildah build --no-cache --layers $WITH_POLICY_JSON -t oci:${TEST_SCRATCH_DIR}/oci-url2 $contextdir
-  
+
   diffid1=$(oci_image_diff_id ${TEST_SCRATCH_DIR}/oci-url1 1)
   diffid2=$(oci_image_diff_id ${TEST_SCRATCH_DIR}/oci-url2 1)
-  
+
   assert "$diffid1" = "$diffid2" "ADD --link with URL should have consistent diffID"
 }
 
@@ -9018,6 +9060,74 @@ EOF
   done
 }
 
+@test "bud with --iidfile-raw" {
+  target=scratch-image
+  local contextdir=${TEST_SCRATCH_DIR}/context
+  mkdir -p "${contextdir}"
+  cat > "${contextdir}"/Dockerfile <<-EOF
+  FROM scratch
+  COPY . .
+EOF
+  for layers in "--layers=true" "--layers=false" ; do
+    for destination in "dir:${TEST_SCRATCH_DIR}/dir" "oci-archive:${TEST_SCRATCH_DIR}/oci-archive" "docker-archive:${TEST_SCRATCH_DIR}/docker-archive" "oci:${TEST_SCRATCH_DIR}/oci-layout" "local" ; do
+      rm -f "${TEST_SCRATCH_DIR}"/iidfile-raw
+      fsname="${destination#*:}" # assume : is used in a non-containers-storage name rather than a repository name + tag combination
+      if test "${fsname}" != "${destination}" ; then
+        rm -fr "${fsname}"
+      fi
+      run_buildah build --iidfile-raw "${TEST_SCRATCH_DIR}"/iidfile-raw --no-cache "${layers}" -t "${destination}" "${contextdir}"
+      local iid_raw=$(cat "${TEST_SCRATCH_DIR}"/iidfile-raw)
+      # iidfile-raw should contain just the hash without sha256: prefix
+      assert "${iid_raw}" != ""
+      assert "${iid_raw}" =~ "^[0-9a-f]{64}$"
+      # Verify it doesn't contain sha256: prefix
+      assert "${iid_raw}" !~ "sha256:"
+      if test "${fsname}" != "${destination}" ; then
+        test -e "${fsname}"
+      fi
+    done
+  done
+}
+
+@test "bud with --iidfile and --iidfile-raw comparison" {
+  target=scratch-image
+  local contextdir=${TEST_SCRATCH_DIR}/context
+  mkdir -p "${contextdir}"
+  cat > "${contextdir}"/Dockerfile <<-EOF
+  FROM scratch
+  COPY . .
+EOF
+  # Build with both --iidfile and --iidfile-raw to verify they write the same image ID
+  run_buildah build --iidfile "${TEST_SCRATCH_DIR}"/iidfile --iidfile-raw "${TEST_SCRATCH_DIR}"/iidfile-raw -t "${target}" "${contextdir}"
+  local iid=$(cat "${TEST_SCRATCH_DIR}"/iidfile)
+  local iid_raw=$(cat "${TEST_SCRATCH_DIR}"/iidfile-raw)
+
+  # iid should have sha256: prefix, iid_raw should not
+  assert "${iid}" =~ "^sha256:[0-9a-f]{64}$"
+  assert "${iid_raw}" =~ "^[0-9a-f]{64}$"
+
+  # The hash portion should be identical
+  assert "${iid#sha256:}" == "${iid_raw}"
+}
+
+@test "bud with --raw-iidfile alias" {
+  target=scratch-image
+  local contextdir=${TEST_SCRATCH_DIR}/context
+  mkdir -p "${contextdir}"
+  cat > "${contextdir}"/Dockerfile <<-EOF
+  FROM scratch
+  COPY . .
+EOF
+  # Test that --raw-iidfile works as an alias for --iidfile-raw
+  run_buildah build --raw-iidfile "${TEST_SCRATCH_DIR}"/iidfile-alias -t "${target}" "${contextdir}"
+  local iid_alias=$(cat "${TEST_SCRATCH_DIR}"/iidfile-alias)
+
+  # Should contain just the hash without sha256: prefix
+  assert "${iid_alias}" != ""
+  assert "${iid_alias}" =~ "^[0-9a-f]{64}$"
+  assert "${iid_alias}" !~ "sha256:"
+}
+
 @test "build-oci-archive-switch" {
   local base=busybox
   _prefetch $base
@@ -9060,6 +9170,327 @@ EOF
   run_buildah build ${TEST_SCRATCH_DIR}/buildcontext
 }
 
+@test "build-with-run-mount" {
+  local out_path=${TEST_SCRATCH_DIR}/run-mount.tar
+
+  # add an ephemeral mount
+  FOO=world run_buildah build \
+      --secret id=mysecret,env=FOO \
+      --mount type=secret,id=mysecret,dst=/bar,required \
+      --timestamp 0 \
+      --tag oci-archive:"${out_path}.a" \
+      -f <(printf 'FROM busybox\nRUN echo "hello $(cat /bar) welcome"')
+  expect_output --substring "hello world welcome"
+
+  # if we run the same, but no secret and no mount, we should get identical tarball
+  run_buildah build \
+      --timestamp 0 \
+      --tag oci-archive:"${out_path}.b" \
+      -f <(printf 'FROM busybox\nRUN echo "hello $(cat /bar) welcome"')
+  expect_output --substring "hello  welcome"
+
+  # should be the same, as the ephemeral run mount should not affect the result
+  diff "${out_path}.a" "${out_path}.b"
+}
+
+@test "build-with-run-image-mount" {
+  _prefetch busybox
+  local contextdir=${TEST_SCRATCH_DIR}/context
+  mkdir -p "${contextdir}"
+  cat > "${contextdir}"/Containerfile << _EOF
+  FROM busybox
+  RUN cat /alpine/etc/os-release | tee /alpine.os-release
+_EOF
+  run_buildah build --mount=type=bind,from=alpine,target=/alpine "${contextdir}"
+}
+
+@test "bud with FROM --after" {
+  # This tests the 'FROM --after' workflow, i.e. that:
+  # - --after is enough to pull in the builder stage as a dep
+  # - even with --jobs=4, --after forces us to wait before even trying to import
+  #   the image
+  # - build arguments for --after are handled correctly
+  # - the final "built" image matches the after stage output exactly
+  _prefetch busybox
+  local contextdir=${TEST_SCRATCH_DIR}/context
+  mkdir -p "${contextdir}"
+  copy containers-storage:busybox oci-archive:"${contextdir}"/busybox.ociarchive
+  # Re-import it so we have it in OCI format and not v2s2 so we can compare
+  # image IDs later on.
+  copy oci-archive:"${contextdir}"/busybox.ociarchive containers-storage:busybox-oci
+  cat > "${contextdir}"/Containerfile << 'EOF'
+ARG TESTARG=builder
+FROM busybox AS builder
+# copy it to a different name as proof that this RUN stage must've run
+RUN --mount=type=bind,target=/src,rw cp /src/busybox.ociarchive /src/out.ociarchive
+
+FROM --after=${TESTARG} oci-archive:out.ociarchive
+EOF
+  run_buildah build $WITH_POLICY_JSON --jobs=4 -t test-after "${contextdir}"
+  # Verify the final image is identical to the OCI-converted busybox
+  run_buildah inspect --format '{{.FromImageID}}' busybox-oci
+  local busybox_id="$output"
+  run_buildah inspect --format '{{.FromImageID}}' test-after
+  local test_after_id="$output"
+  assert "$busybox_id" == "$test_after_id"
+}
+
+@test "bud with FROM --after and COPY --from" {
+  _prefetch busybox
+  local contextdir=${TEST_SCRATCH_DIR}/context
+  mkdir -p "${contextdir}"
+  cat > "${contextdir}"/Containerfile << 'EOF'
+FROM busybox AS builder
+RUN echo "Artifact Created" > /data.txt
+
+FROM busybox AS verifier
+COPY --from=builder /data.txt /data.txt
+RUN echo "Artifact Appended" >> /data.txt
+
+# this must wait until the builder stage is finished
+FROM --after=builder busybox AS final
+# this must wait until the verifier stage is finished
+COPY --from=verifier /data.txt /root/data.txt
+RUN grep "Artifact Created" /root/data.txt
+RUN grep "Artifact Appended" /root/data.txt
+EOF
+  run_buildah build $WITH_POLICY_JSON --jobs=4 -t test-after-copy-from "${contextdir}"
+}
+
+@test "bud with FROM --after error cases" {
+  local contextdir=${TEST_SCRATCH_DIR}/context
+  mkdir -p "${contextdir}"
+
+  # self-reference should fail
+  cat > "${contextdir}"/Containerfile << 'EOF'
+FROM --after=self scratch AS self
+EOF
+  run_buildah 125 build $WITH_POLICY_JSON "${contextdir}"
+  expect_output --substring "FROM --after=self: cannot depend on later stage"
+
+  # attempt a circular dependency
+  cat > "${contextdir}"/Containerfile << 'EOF'
+FROM --after=second busybox AS first
+RUN echo first
+FROM first AS second
+RUN echo second
+EOF
+  run_buildah 125 build $WITH_POLICY_JSON "${contextdir}"
+  expect_output --substring "FROM --after=second: stage \"second\" not found"
+}
+
+@test "bud-windows-host-process-container" {
+  skip_if_rootless_environment
+  # Test building a Windows container image on Linux
+  # This validates that the Windows layer mutations are applied correctly
+  _prefetch alpine
+
+  local contextdir=${TEST_SCRATCH_DIR}/windows-context
+  mkdir -p ${contextdir}
+
+  # Create a test file to copy into the Windows image
+  echo "test" > ${contextdir}/testfile
+
+  # Create inline Dockerfile for Windows container
+  cat > ${contextdir}/Dockerfile << _EOF
+FROM alpine as build
+RUN echo "test" > testfile
+
+FROM --platform=windows/amd64 mcr.microsoft.com/oss/kubernetes/windows-host-process-containers-base-image:v1.0.0
+COPY --from=build testfile /testfile
+ENV PATH="C:\Windows\system32;C:\Windows;C:\WINDOWS\System32\WindowsPowerShell\v1.0\;"
+USER ContainerAdministrator
+_EOF
+
+  # Build the Windows container image directly to OCI format
+  local ocidir=${TEST_SCRATCH_DIR}/oci-windows
+  run_buildah build $WITH_POLICY_JSON -t oci:${ocidir} ${contextdir}
+
+  # Create a container from the OCI image and mount it
+  run_buildah from --quiet oci:${ocidir}
+  # Extract just the container ID (last line), ignoring warning messages
+  cid=$(echo "$output" | tail -1)
+  run_buildah mount ${cid}
+  root=$(echo "$output" | tail -1)
+
+  # Verify the Windows-specific directory structure was created
+  # The Windows mutator should create /Hives and /Files directories
+  test -d ${root}/Hives/
+  test -d ${root}/Files/
+
+  # Verify that the copied testfile exists in the correct location
+  # The COPY instruction copies to /testfile, but the Windows mutator
+  # should relocate it to /Files/testfile
+  test -f ${root}/Files/testfile
+
+  # Verify Windows-specific PAX attributes are present in the layer
+  # Get the last layer blob using helper function
+  local layer_file=${ocidir}/$(oci_image_last_diff ${ocidir})
+
+  # Decompress the layer and check for Windows-specific PAX headers
+  # The layer contains PAX extended headers with MSWINDOWS.fileattr
+  local layer_tar=${TEST_SCRATCH_DIR}/layer.tar
+  gzip -dc ${layer_file} > ${layer_tar} 2>/dev/null || cat ${layer_file} > ${layer_tar}
+
+  # Verify the layer contains the expected Windows structure
+  run tar -tf ${layer_tar}
+  expect_output --substring "Hives/"
+  expect_output --substring "Files/testfile"
+
+  # Check for Windows-specific PAX headers on all expected paths
+  # Each file/directory should have: MSWINDOWS.fileattr, MSWINDOWS.rawsd, and LIBARCHIVE.creationtime
+  # Use tar's verbose output which shows when it encounters these headers
+  local required_paths=("Hives/" "Files/" "Files/testfile")
+
+  # Run tar and capture its stderr which contains PAX header warnings
+  local tar_output=${TEST_SCRATCH_DIR}/tar_output.txt
+  tar -tvf ${layer_tar} 2>&1 | tee ${tar_output}
+
+  # For each path, verify that the PAX headers appear immediately before it
+  for path in "${required_paths[@]}"; do
+    # Extract lines before this path entry (PAX warnings appear just before the file)
+    # We need to find the block of PAX warnings that precede this specific path
+    local line_num=$(grep -n "^.*${path}\$" ${tar_output} | head -1 | cut -d: -f1)
+
+    if [ -z "${line_num}" ]; then
+      echo "ERROR: Path ${path} not found in tar listing"
+      false
+    fi
+
+    # Get the preceding 10 lines which should contain PAX header warnings
+    local context_start=$((line_num - 10))
+    if [ ${context_start} -lt 1 ]; then
+      context_start=1
+    fi
+    local preceding_lines=$(sed -n "${context_start},$((line_num - 1))p" ${tar_output})
+
+    # Check for required headers in the preceding PAX warnings
+    if ! echo "${preceding_lines}" | grep -q "MSWINDOWS.fileattr" ; then
+      echo "ERROR: MSWINDOWS.fileattr not found for ${path}"
+      echo "Context around ${path}:"
+      sed -n "${context_start},${line_num}p" ${tar_output}
+      false
+    fi
+
+    if ! echo "${preceding_lines}" | grep -q "LIBARCHIVE.creationtime" ; then
+      echo "ERROR: LIBARCHIVE.creationtime not found for ${path}"
+      echo "Context around ${path}:"
+      sed -n "${context_start},${line_num}p" ${tar_output}
+      false
+    fi
+
+    # MSWINDOWS.rawsd should be present for all paths (files and directories)
+    if ! echo "${preceding_lines}" | grep -q "MSWINDOWS.rawsd" ; then
+      echo "ERROR: MSWINDOWS.rawsd not found for ${path}"
+      echo "Context around ${path}:"
+      sed -n "${context_start},${line_num}p" ${tar_output}
+      false
+    fi
+  done
+
+  # Cleanup
+  run_buildah umount ${cid}
+  run_buildah rm ${cid}
+}
+
+@test "bud-windows-with-timestamp-reproducible" {
+  skip_if_rootless_environment
+
+  _prefetch alpine
+
+  local contextdir=${TEST_SCRATCH_DIR}/windows-context
+  mkdir -p ${contextdir}
+
+  cat > ${contextdir}/Dockerfile << _EOF
+FROM alpine as build
+RUN echo "test" > testfile
+
+FROM --platform=windows/amd64 mcr.microsoft.com/oss/kubernetes/windows-host-process-containers-base-image:v1.0.0
+COPY --from=build testfile /testfile
+_EOF
+
+  # Build twice with the same timestamp - should produce identical results
+  local timestamp=86400
+  run_buildah build $WITH_POLICY_JSON --timestamp=${timestamp} -t oci:${TEST_SCRATCH_DIR}/windows-a ${contextdir}
+  sleep 1.1 # sleep at least 1 second, so that timestamps are incremented
+  run_buildah build $WITH_POLICY_JSON --timestamp=${timestamp} -t oci:${TEST_SCRATCH_DIR}/windows-b ${contextdir}
+
+  # should be the same (all timestamps including Hives and Files directories should be identical)
+  diff -r "${TEST_SCRATCH_DIR}/windows-a" "${TEST_SCRATCH_DIR}/windows-b"
+
+  # Verify that all files in the layer have the correct timestamp
+  local layer=${TEST_SCRATCH_DIR}/windows-a/$(oci_image_last_diff ${TEST_SCRATCH_DIR}/windows-a)
+  mkdir -p ${TEST_SCRATCH_DIR}/layer
+  gzip -dc ${layer} > ${TEST_SCRATCH_DIR}/layer.tar 2>/dev/null || cat ${layer} > ${TEST_SCRATCH_DIR}/layer.tar
+  tar -C ${TEST_SCRATCH_DIR}/layer -xvf ${TEST_SCRATCH_DIR}/layer.tar
+
+  # Check timestamps on all files including Hives and Files directories
+  for file in $(find ${TEST_SCRATCH_DIR}/layer/* -print) ; do
+    run stat -c %Y $file
+    assert $status = 0 "checking datestamp on $file in layer"
+    assert "$output" = "$timestamp" "unexpected datestamp on $file in layer (expected ${timestamp}, got ${output})"
+  done
+}
+
+@test "bud-windows-with-source-date-epoch-reproducible" {
+  skip_if_rootless_environment
+
+  _prefetch alpine
+
+  local contextdir=${TEST_SCRATCH_DIR}/windows-context
+  mkdir -p ${contextdir}
+
+  # Create files with different timestamps to test clamping behavior
+  local old_timestamp=10000  # Older than source-date-epoch (should be preserved)
+  local source_date_epoch=86400  # The clamping threshold
+
+  # Create an old file (timestamp older than source-date-epoch)
+  echo "old" > ${contextdir}/oldfile
+  touch -d @${old_timestamp} ${contextdir}/oldfile
+
+  # Create a new file (timestamp will be current time, newer than source-date-epoch)
+  echo "new" > ${contextdir}/newfile
+
+  cat > ${contextdir}/Dockerfile << _EOF
+FROM --platform=windows/amd64 mcr.microsoft.com/oss/kubernetes/windows-host-process-containers-base-image:v1.0.0
+COPY oldfile /oldfile
+COPY newfile /newfile
+_EOF
+
+  # Build twice with the same source-date-epoch and rewrite-timestamp
+  run_buildah build $WITH_POLICY_JSON --source-date-epoch=${source_date_epoch} --rewrite-timestamp -t oci:${TEST_SCRATCH_DIR}/windows-a ${contextdir}
+  sleep 1.1 # sleep at least 1 second, so that timestamps are incremented
+  run_buildah build $WITH_POLICY_JSON --source-date-epoch=${source_date_epoch} --rewrite-timestamp -t oci:${TEST_SCRATCH_DIR}/windows-b ${contextdir}
+
+  # should be the same (reproducible builds)
+  diff -r "${TEST_SCRATCH_DIR}/windows-a" "${TEST_SCRATCH_DIR}/windows-b"
+
+  # Verify timestamp clamping behavior
+  local layer=${TEST_SCRATCH_DIR}/windows-a/$(oci_image_last_diff ${TEST_SCRATCH_DIR}/windows-a)
+  mkdir -p ${TEST_SCRATCH_DIR}/layer
+  gzip -dc ${layer} > ${TEST_SCRATCH_DIR}/layer.tar 2>/dev/null || cat ${layer} > ${TEST_SCRATCH_DIR}/layer.tar
+  tar -C ${TEST_SCRATCH_DIR}/layer -xvf ${TEST_SCRATCH_DIR}/layer.tar
+
+  # Check that Hives and Files directories are clamped to source-date-epoch
+  run stat -c %Y ${TEST_SCRATCH_DIR}/layer/Hives
+  assert $status = 0 "checking datestamp on Hives directory"
+  assert "$output" = "$source_date_epoch" "Hives directory should be clamped to source-date-epoch (expected ${source_date_epoch}, got ${output})"
+
+  run stat -c %Y ${TEST_SCRATCH_DIR}/layer/Files
+  assert $status = 0 "checking datestamp on Files directory"
+  assert "$output" = "$source_date_epoch" "Files directory should be clamped to source-date-epoch (expected ${source_date_epoch}, got ${output})"
+
+  # Check that oldfile preserves its old timestamp (older than source-date-epoch)
+  run stat -c %Y ${TEST_SCRATCH_DIR}/layer/Files/oldfile
+  assert $status = 0 "checking datestamp on oldfile"
+  assert "$output" = "$old_timestamp" "oldfile should preserve old timestamp (expected ${old_timestamp}, got ${output})"
+
+  # Check that newfile is clamped to source-date-epoch (was newer, got clamped)
+  run stat -c %Y ${TEST_SCRATCH_DIR}/layer/Files/newfile
+  assert $status = 0 "checking datestamp on newfile"
+  assert "$output" = "$source_date_epoch" "newfile should be clamped to source-date-epoch (expected ${source_date_epoch}, got ${output})"
+}
+
 @test "use-secret-to-env-variable" {
   local outpath="${TEST_SCRATCH_DIR}/timestamp-after-secret.tar"
 
@@ -9072,10 +9503,18 @@ EOF
   diff "${outpath}.a" "${outpath}.b"
 }
 
-@test "secret-env-overrides-image-env" {
-  # The image declares FOO=fromimage. The secret mounted as env=FOO must win,
-  # regardless of how the OCI runtime handles duplicate env entries.
-  BAR=fromsecret run_buildah build --secret id=mysecret,env=BAR -f <(printf "FROM alpine\nENV FOO=fromimage\nRUN --mount=type=secret,id=mysecret,env=FOO,required sh -c 'echo \"got=\$FOO\"'")
-  expect_output --substring "got=fromsecret"
-  assert "$output" !~ "got=fromimage"
+@test "use-secret-to-env-variable-and-file-path" {
+  local outpath="${TEST_SCRATCH_DIR}/timestamp-after-secret-and-path.tar"
+
+  # here we mount the secret as both an env variable AND at a file path
+  # neither of which should affect the build history
+
+  BAR=baz run_buildah build --secret id=mysecret,env=BAR -f <(printf "FROM alpine\nRUN --mount=type=secret,id=mysecret,env=FOO,target=/foo,required sh -c 'echo -n "'"Hello $FOO "'" && cat /foo'") --tag=oci-archive:${outpath}.a --timestamp 0
+  expect_output --substring "Hello baz baz"
+
+  BAR=boz run_buildah build --secret id=mysecret,env=BAR -f <(printf "FROM alpine\nRUN --mount=type=secret,id=mysecret,env=FOO,target=/foo,required sh -c 'echo -n "'"Hello $FOO "'" && cat /foo'") --tag=oci-archive:${outpath}.b --timestamp 0
+  expect_output --substring "Hello boz boz"
+
+  # even though different secret was passed to each(baz vs boz), we expect the same result, ie should not affect build history
+  diff "${outpath}.a" "${outpath}.b"
 }

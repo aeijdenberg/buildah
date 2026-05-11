@@ -515,6 +515,14 @@ Path to an alternative .containerignore (.dockerignore) file.
 Write the built image's ID to the file.  When `--platform` is specified more
 than once, attempting to use this option will trigger an error.
 
+**--iidfile-raw** *ImageIDfile*
+
+Write the built image's ID to the file without the algorithm prefix
+(e.g., `sha256:`). When `--platform` is specified more than once, attempting to
+use this option will trigger an error.
+
+An alias `--raw-iidfile` is also available.
+
 **--inherit-annotations** *bool-value*
 
 Inherit the annotations from the base image or base stages. (default true).
@@ -630,6 +638,20 @@ unit, `b` is used. Set LIMIT to `-1` to enable unlimited swap.
 Write information about the built image to the named file.  When `--platform`
 is specified more than once, attempting to use this option will trigger an
 error.
+
+**--mount** *mount-instruction*
+
+Adds this mount to each `RUN` command in a Containerfile before executing. For example:
+
+`buildah build --mount type=secret,id=mysecret ...`
+
+and a Containerfile entry of:
+
+`RUN cat /run/secrets/mysecret`
+
+Has the same effect as:
+
+`RUN --mount=type=secret,id=mysecret cat /run/secrets/mysecret`
 
 **--network**, **--net**=*mode*
 
@@ -1041,6 +1063,67 @@ will bear exactly the specified timestamp.
 Conflicts with the similar **--timestamp** flag, which also sets its specified
 time on the contents of new layers.
 
+**--source-policy-file** *pathname*
+
+Specifies the path to a BuildKit-compatible source policy JSON file.  When
+specified, source references (e.g., base images in FROM instructions) are
+evaluated against the policy rules before being used.
+
+Source policies allow controlling which images can be used as base images and
+optionally converting image references (e.g., pinning tags to specific digests)
+without modifying Containerfiles.  This is useful for enforcing organizational
+policies and ensuring build reproducibility.
+
+The policy file is a JSON document containing an array of rules.  Each rule has:
+- **action**: The action to take when the rule matches.  Valid actions are:
+  - **ALLOW**: Explicitly allow the source (no transformation).
+  - **DENY**: Block the source and fail the build.
+  - **CONVERT**: Transform the source to a different reference specified in `updates`.
+- **selector**: Specifies which sources the rule applies to.
+  - **identifier**: The source identifier to match (e.g., `docker-image://docker.io/library/alpine:latest`).
+  - **matchType**: How to match the identifier.  Valid types are `EXACT` and `WILDCARD` (supports `*` and `?` glob patterns).  Defaults to `WILDCARD` if not specified.
+- **updates**: For `CONVERT` actions, specifies the replacement identifier.
+
+Rules are evaluated in order; the first matching rule wins.  If no rule matches,
+the source is allowed by default.
+
+Note: Source policy CONVERT rules are processed after **--build-context** substitutions
+but before any substitutions specified in **containers-registries.conf(5)**.  This provides
+multiple ways to override which base image is used for a particular stage, in order of
+precedence: `--build-context`, then source policy, then registries.conf.
+
+Example policy file that pins alpine:latest to a specific digest:
+```json
+{
+  "rules": [
+    {
+      "action": "CONVERT",
+      "selector": {
+        "identifier": "docker-image://docker.io/library/alpine:latest"
+      },
+      "updates": {
+        "identifier": "docker-image://docker.io/library/alpine@sha256:..."
+      }
+    }
+  ]
+}
+```
+
+Example policy file that denies all ubuntu images:
+```json
+{
+  "rules": [
+    {
+      "action": "DENY",
+      "selector": {
+        "identifier": "docker-image://docker.io/library/ubuntu:*",
+        "matchType": "WILDCARD"
+      }
+    }
+  ]
+}
+```
+
 **--squash**
 
 Squash all layers, including those from base image(s), into one single layer. (Default is false).
@@ -1422,6 +1505,22 @@ buildah build --secret=id=mysecret,src=MYSECRET,type=env .
 buildah build --secret=id=mysecret,src=.mysecret,type=file .
 
 buildah build --secret=id=mysecret,src=.mysecret .
+
+### Building an image with a source policy
+
+buildah build --source-policy-file /etc/buildah/source-policy.json -t imageName .
+
+### Using FROM --after for explicit stage dependencies
+
+When using local transports like `FROM oci-archive:file.ociarchive` where the file is produced by an earlier stage, Buildah cannot automatically detect the dependency. Use the `--after` flag on the FROM instruction to declare explicit stage dependencies:
+
+```Dockerfile
+FROM quay.io/skopeo/stable AS builder
+RUN --mount=type=bind,target=/src,rw skopeo copy docker://quay.io/fedora/fedora-minimal oci-archive:/src/fedora.ociarchive
+
+FROM --after=builder oci-archive:fedora.ociarchive
+# This stage will wait for builder to complete before evaluating FROM
+```
 
 ### Building an multi-architecture image using the --manifest option (requires emulation software)
 

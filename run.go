@@ -177,7 +177,7 @@ type RunOptions struct {
 	// unmounted if Run() returned an error
 	ExternalImageMounts []string
 	// System context of current build
-	SystemContext *types.SystemContext
+	SystemContext *types.SystemContext `json:"-"`
 	// CgroupManager to use for running OCI containers
 	CgroupManager string
 	// CDIConfigDir is the location of CDI configuration files, if the files in
@@ -199,14 +199,12 @@ type runMountArtifacts struct {
 	MountedImages []string
 	// Agents are the ssh agents started, which should have their Shutdown() methods called
 	Agents []*sshagent.AgentServer
-	// SSHAuthSock is the path to the ssh auth sock inside the container
-	SSHAuthSock string
 	// Lock files, which should have their Unlock() methods called
 	TargetLocks []*lockfile.LockFile
 	// Intermediate mount points, which should be Unmount()ed and Removed()d
 	IntermediateMounts []string
-	// Environment variables that should be set for RUN that contain secrets, each is name=value form
-	SecretEnvVars []string
+	// Environment variables that should be set for RUN that may contain secrets, each is name=value form
+	EnvVars []string
 }
 
 // RunMountInfo are the available run mounts for this run

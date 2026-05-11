@@ -1421,7 +1421,7 @@ func (b *Builder) setupMounts(mountPoint string, spec *specs.Spec, bundlePath st
 	}
 	mountArtifacts.RunOverlayDirs = append(mountArtifacts.RunOverlayDirs, overlayDirs...)
 
-	allMounts := util.SortMounts(append(append(append(append(append(volumes, builtins...), runMounts...), subscriptionMounts...), bindFileMounts...), specMounts...))
+	allMounts := util.SortMounts(slices.Concat(volumes, builtins, runMounts, subscriptionMounts, bindFileMounts, specMounts))
 
 	// Add them all, in the preferred order, except where they conflict with something that was previously added.
 	for _, mount := range allMounts {
@@ -1433,34 +1433,8 @@ func (b *Builder) setupMounts(mountPoint string, spec *specs.Spec, bundlePath st
 		mounts = append(mounts, mount)
 	}
 
-	// Append mount-derived env vars (secrets exposed via env=, and SSH_AUTH_SOCK)
-	// and ensure they take precedence over any same-named entry that may already
-	// be present from the image config or the build environment. Without this,
-	// behaviour with duplicate env entries depends on the OCI runtime, which
-	// can cause the user-supplied secret value to be silently shadowed.
-	extra := append([]string(nil), mountArtifacts.SecretEnvVars...)
-	if mountArtifacts.SSHAuthSock != "" {
-		extra = append(extra, "SSH_AUTH_SOCK="+mountArtifacts.SSHAuthSock)
-	}
-	if len(extra) > 0 {
-		override := make(map[string]struct{}, len(extra))
-		for _, e := range extra {
-			name, _, ok := strings.Cut(e, "=")
-			if !ok || name == "" {
-				continue
-			}
-			override[name] = struct{}{}
-		}
-		filtered := spec.Process.Env[:0]
-		for _, env := range spec.Process.Env {
-			name, _, _ := strings.Cut(env, "=")
-			if _, drop := override[name]; drop {
-				continue
-			}
-			filtered = append(filtered, env)
-		}
-		spec.Process.Env = append(filtered, extra...)
-	}
+	// Some mounts require env vars to be set, do these here
+	spec.Process.Env = append(spec.Process.Env, mountArtifacts.EnvVars...)
 
 	// Set the list in the spec.
 	spec.Mounts = mounts
@@ -1551,8 +1525,7 @@ func (b *Builder) runSetupRunMounts(bundlePath string, mounts []string, sources 
 	intermediateMounts := make([]string, 0, len(mounts))
 	finalMounts := make([]specs.Mount, 0, len(mounts))
 	agents := make([]*sshagent.AgentServer, 0, len(mounts))
-	var secretEnvVars []string
-	defaultSSHSock := ""
+	var envVars []string
 	targetLocks := []*lockfile.LockFile{}
 	var overlayDirs []string
 	succeeded := false
@@ -1620,7 +1593,7 @@ func (b *Builder) runSetupRunMounts(bundlePath string, mounts []string, sources 
 				tmpFiles = append(tmpFiles, mountOrEnvSpec.EnvFile)
 			}
 			if mountOrEnvSpec.EnvVariable != "" {
-				secretEnvVars = append(secretEnvVars, mountOrEnvSpec.EnvVariable)
+				envVars = append(envVars, mountOrEnvSpec.EnvVariable)
 			}
 		case "ssh":
 			mountSpec, agent, err := b.getSSHMount(tokens, len(agents), sources.SSHSources, idMaps)
@@ -1630,7 +1603,7 @@ func (b *Builder) runSetupRunMounts(bundlePath string, mounts []string, sources 
 			if mountSpec != nil {
 				finalMounts = append(finalMounts, *mountSpec)
 				if len(agents) == 0 {
-					defaultSSHSock = mountSpec.Destination
+					envVars = append(envVars, "SSH_AUTH_SOCK="+mountSpec.Destination)
 				}
 				agents = append(agents, agent)
 			}
@@ -1694,10 +1667,9 @@ func (b *Builder) runSetupRunMounts(bundlePath string, mounts []string, sources 
 		RunOverlayDirs:     overlayDirs,
 		Agents:             agents,
 		MountedImages:      mountImages,
-		SSHAuthSock:        defaultSSHSock,
 		TargetLocks:        targetLocks,
 		IntermediateMounts: intermediateMounts,
-		SecretEnvVars:      secretEnvVars,
+		EnvVars:            envVars,
 	}
 	return finalMounts, artifacts, nil
 }
@@ -1763,34 +1735,27 @@ func (b *Builder) getTmpfsMount(tokens []string, idMaps IDMaps, workDir string) 
 	return &volumes[0], nil
 }
 
-// secretMountResult is the outcome of resolving a --mount=type=secret token list.
-// Exactly one of Mount or EnvVariable is populated when the secret was found.
-type secretMountResult struct {
-	Mount       *specs.Mount // bind mount that exposes the secret as a file
-	EnvFile     string       // temp file backing Mount, must be cleaned up by caller
-	EnvVariable string       // "NAME=value" entry to append to the process env
+type secretMountOrEnv struct {
+	// set if mount created
+	Mount *specs.Mount
+
+	// set if caller mount created from temp created env file
+	EnvFile string
+
+	// set if caller should add to env variable list
+	EnvVariable string
 }
 
-func resolveSecretValue(s define.Secret) ([]byte, error) {
-	switch s.SourceType {
-	case "env":
-		return []byte(os.Getenv(s.Source)), nil
-	case "file":
-		return os.ReadFile(s.Source)
-	default:
-		return nil, errors.New("invalid secret type")
-	}
-}
-
-func (b *Builder) getSecretMount(tokens []string, secrets map[string]define.Secret, idMaps IDMaps, workdir string) (rv secretMountResult, retErr error) {
+func (b *Builder) getSecretMount(tokens []string, secrets map[string]define.Secret, idMaps IDMaps, workdir string) (_ secretMountOrEnv, retErr error) {
 	errInvalidSyntax := errors.New("secret should have syntax id=id[,target=path,required=bool,mode=uint,uid=uint,gid=uint,env=dstVarName")
 	if len(tokens) == 0 {
-		return rv, errInvalidSyntax
+		return secretMountOrEnv{}, errInvalidSyntax
 	}
 	var id, target, env string
 	var required bool
 	var uid, gid uint32
 	var mode uint32 = 0o400
+	var rv secretMountOrEnv
 	for _, val := range tokens {
 		kv := strings.SplitN(val, "=", 2)
 		switch kv[0] {
@@ -1810,64 +1775,73 @@ func (b *Builder) getSecretMount(tokens []string, secrets map[string]define.Secr
 				var err error
 				required, err = strconv.ParseBool(kv[1])
 				if err != nil {
-					return rv, errInvalidSyntax
+					return secretMountOrEnv{}, errInvalidSyntax
 				}
 			}
 		case "mode":
 			mode64, err := strconv.ParseUint(kv[1], 8, 32)
 			if err != nil {
-				return rv, errInvalidSyntax
+				return secretMountOrEnv{}, errInvalidSyntax
 			}
 			mode = uint32(mode64)
 		case "uid":
 			uid64, err := strconv.ParseUint(kv[1], 10, 32)
 			if err != nil {
-				return rv, errInvalidSyntax
+				return secretMountOrEnv{}, errInvalidSyntax
 			}
 			uid = uint32(uid64)
 		case "gid":
 			gid64, err := strconv.ParseUint(kv[1], 10, 32)
 			if err != nil {
-				return rv, errInvalidSyntax
+				return secretMountOrEnv{}, errInvalidSyntax
 			}
 			gid = uint32(gid64)
 		case "env":
 			if kv[1] == "" {
-				return rv, errInvalidSyntax
+				return secretMountOrEnv{}, errInvalidSyntax
 			}
 			env = kv[1]
 		default:
-			return rv, errInvalidSyntax
+			return secretMountOrEnv{}, errInvalidSyntax
+		}
+	}
+
+	// apply defaults, matching documented behaviour
+	if target == "" {
+		if env == "" {
+			target = "/run/secrets/" + id
+		}
+	} else {
+		if id == "" {
+			id = filepath.Base(target)
 		}
 	}
 
 	if id == "" {
-		return rv, errInvalidSyntax
+		return secretMountOrEnv{}, errInvalidSyntax
 	}
 
 	// first fetch the secret data
 	secr, ok := secrets[id]
 	if !ok {
 		if required {
-			return rv, fmt.Errorf("secret required but no secret with id %q found", id)
+			return secretMountOrEnv{}, fmt.Errorf("secret required but no secret with id %q found", id)
 		}
 		return rv, nil
 	}
-	data, err := resolveSecretValue(secr)
+	data, err := secr.ResolveValue()
 	if err != nil {
-		return rv, err
+		return secretMountOrEnv{}, err
 	}
 
-	// if env is set, then we can return now
+	// if env is set, then we set that
 	if env != "" {
 		rv.EnvVariable = env + "=" + string(data)
-		return rv, nil
 	}
-	// else we fallback to default behaviour of creating mount
 
-	// Default location for secrets is /run/secrets/id
+	// if no target needs to be mounted, then return now, we're done
 	if target == "" {
-		target = "/run/secrets/" + id
+		return rv, nil
 	}
 
 	var ctrFileOnHost string
@@ -1876,7 +1850,7 @@ func (b *Builder) getSecretMount(tokens []string, secrets map[string]define.Secr
 	case "env":
 		tmpFile, err := os.CreateTemp(tmpdir.GetTempDir(), "buildah*")
 		if err != nil {
-			return rv, err
+			return secretMountOrEnv{}, err
 		}
 		defer func() {
 			if retErr != nil {
@@ -1888,34 +1862,34 @@ func (b *Builder) getSecretMount(tokens []string, secrets map[string]define.Secr
 	case "file":
 		containerWorkingDir, err := b.store.ContainerDirectory(b.ContainerID)
 		if err != nil {
-			return rv, err
+			return secretMountOrEnv{}, err
 		}
 		ctrFileOnHost = filepath.Join(containerWorkingDir, "secrets", digest.FromString(id).Encoded()[:16])
 	default:
-		return rv, errors.New("invalid source secret type")
+		return secretMountOrEnv{}, errors.New("invalid source secret type")
 	}
 
 	// Copy secrets to container working dir (or tmp dir if it's an env), since we need to chmod,
 	// chown and relabel it for the container user and we don't want to mess with the original file
 	if err := os.MkdirAll(filepath.Dir(ctrFileOnHost), 0o755); err != nil {
-		return rv, err
+		return secretMountOrEnv{}, err
 	}
 	if err := os.WriteFile(ctrFileOnHost, data, 0o644); err != nil {
-		return rv, err
+		return secretMountOrEnv{}, err
 	}
 
 	if err := relabel(ctrFileOnHost, b.MountLabel, false); err != nil {
-		return rv, err
+		return secretMountOrEnv{}, err
 	}
 	hostUID, hostGID, err := util.GetHostIDs(idMaps.uidmap, idMaps.gidmap, uid, gid)
 	if err != nil {
-		return rv, err
+		return secretMountOrEnv{}, err
 	}
 	if err := os.Lchown(ctrFileOnHost, int(hostUID), int(hostGID)); err != nil {
-		return rv, err
+		return secretMountOrEnv{}, err
 	}
 	if err := os.Chmod(ctrFileOnHost, os.FileMode(mode)); err != nil {
-		return rv, err
+		return secretMountOrEnv{}, err
 	}
 	rv.Mount = &specs.Mount{
 		Destination: target,

@@ -30,9 +30,9 @@ import (
 	"github.com/containers/buildah/define"
 	"github.com/containers/buildah/imagebuildah"
 	"github.com/containers/buildah/internal/config"
-	dockerbuildtypes "github.com/docker/docker/api/types/build"
-	dockerdockerclient "github.com/docker/docker/client"
 	docker "github.com/fsouza/go-dockerclient"
+	mobyclient "github.com/moby/moby/client"
+	"github.com/moby/moby/client/pkg/versions"
 	digest "github.com/opencontainers/go-digest"
 	rspec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/openshift/imagebuilder"
@@ -184,6 +184,7 @@ func TestConformance(t *testing.T) {
 						test.dockerBuilderVersion = docker.BuilderV1
 						test.compatVolumes = types.OptionalBoolTrue
 						test.compatScratchConfig = types.OptionalBoolTrue
+						test.fsSkip = slices.Concat(test.fsSkip, test.fsSkipCompatVolumesTrue)
 					})
 				})
 			} else {
@@ -330,17 +331,32 @@ func testConformanceInternal(t *testing.T, dateStamp string, testIndex int, muta
 	}
 
 	// connect to dockerd using the docker client library
-	dockerClient, err := dockerdockerclient.NewClientWithOpts(dockerdockerclient.FromEnv)
+	mobyClient, err := mobyclient.New(mobyclient.FromEnv)
 	require.NoError(t, err, "unable to initialize docker.client")
-	dockerClient.NegotiateAPIVersion(ctx)
+	_, err = mobyClient.Ping(ctx, mobyclient.PingOptions{
+		NegotiateAPIVersion: true,
+	})
+	require.NoError(t, err)
 	if test.dockerUseBuildKit || test.dockerBuilderVersion != "" {
-		if err := dockerClient.NewVersionError(ctx, "1.38", "buildkit"); err != nil {
-			t.Skipf("%v", err)
+		negotiatedVersion := mobyClient.ClientVersion()
+		if versions.LessThan(negotiatedVersion, "1.38") {
+			t.Skipf("negotiated version %q is too low", err)
 		}
 	}
 
 	// connect to dockerd using go-dockerclient
-	client, err := docker.NewClientFromEnv()
+	// Later, the client.BuildImage implementation chooses an API version based on
+	// fields set in docker.BuildImageOptions. Because we don’t use _so_ new features,
+	// that can use a fairly old version.
+	//
+	// If we don’t want this old version to be used, we must specify a version ourselves
+	// (the API requries it to be specified when initializing the client). We could create
+	// a client only to call .Version() and then create another client witht the discovered version,
+	// but that’s not really any more correct.
+	//
+	// As of 2026-02, the client is choosing 1.39, while our server supports 1.44–1.52.
+	// Previously we used 1.51, so let’s hard-code that.
+	client, err := docker.NewVersionedClientFromEnv("1.51")
 	require.NoError(t, err, "unable to initialize docker client")
 	var dockerVersion []string
 	if version, err := client.Version(); err == nil {
@@ -370,7 +386,7 @@ func testConformanceInternal(t *testing.T, dateStamp string, testIndex int, muta
 				if line > 1 || !bytes.HasPrefix(dockerfileContents, []byte("FROM ")) {
 					// hack: skip trying to build just the first FROM line
 					t.Run(fmt.Sprintf("%d", line), func(t *testing.T) {
-						testConformanceInternalBuild(ctx, t, cwd, store, client, dockerClient, fmt.Sprintf("%s.%d", buildahImage, line), fmt.Sprintf("%s.%d", dockerImage, line), fmt.Sprintf("%s.%d", imagebuilderImage, line), contextDir, dockerfileName, dockerfileContents[:i+1], test, line, i == len(dockerfileContents)-1, dockerVersion)
+						testConformanceInternalBuild(ctx, t, cwd, store, client, mobyClient, fmt.Sprintf("%s.%d", buildahImage, line), fmt.Sprintf("%s.%d", dockerImage, line), fmt.Sprintf("%s.%d", imagebuilderImage, line), contextDir, dockerfileName, dockerfileContents[:i+1], test, line, i == len(dockerfileContents)-1, dockerVersion)
 					})
 				}
 				line++
@@ -378,11 +394,11 @@ func testConformanceInternal(t *testing.T, dateStamp string, testIndex int, muta
 		}
 	} else {
 		// build to completion
-		testConformanceInternalBuild(ctx, t, cwd, store, client, dockerClient, buildahImage, dockerImage, imagebuilderImage, contextDir, dockerfileName, dockerfileContents, test, 0, true, dockerVersion)
+		testConformanceInternalBuild(ctx, t, cwd, store, client, mobyClient, buildahImage, dockerImage, imagebuilderImage, contextDir, dockerfileName, dockerfileContents, test, 0, true, dockerVersion)
 	}
 }
 
-func testConformanceInternalBuild(ctx context.Context, t *testing.T, cwd string, store storage.Store, client *docker.Client, dockerClient *dockerdockerclient.Client, buildahImage, dockerImage, imagebuilderImage, contextDir, dockerfileName string, dockerfileContents []byte, test testCase, line int, finalOfSeveral bool, dockerVersion []string) {
+func testConformanceInternalBuild(ctx context.Context, t *testing.T, cwd string, store storage.Store, client *docker.Client, mobyClient *mobyclient.Client, buildahImage, dockerImage, imagebuilderImage, contextDir, dockerfileName string, dockerfileContents []byte, test testCase, line int, finalOfSeveral bool, dockerVersion []string) {
 	var buildahLog, dockerLog, imagebuilderLog []byte
 	var buildahRef, dockerRef, imagebuilderRef types.ImageReference
 
@@ -421,7 +437,7 @@ func testConformanceInternalBuild(ctx context.Context, t *testing.T, cwd string,
 
 	// build using docker
 	if !test.withoutDocker {
-		dockerRef, dockerLog = buildUsingDocker(ctx, t, client, dockerClient, test, dockerImage, contextDir, dockerfileName, line, finalOfSeveral)
+		dockerRef, dockerLog = buildUsingDocker(ctx, t, client, mobyClient, test, dockerImage, contextDir, dockerfileName, line, finalOfSeveral)
 		if dockerRef != nil {
 			defer func() {
 				err := client.RemoveImageExtended(dockerImage, docker.RemoveImageOptions{
@@ -664,7 +680,7 @@ func pullImageIfMissing(t *testing.T, client *docker.Client, image string) {
 	}
 }
 
-func buildUsingDocker(ctx context.Context, t *testing.T, client *docker.Client, dockerClient *dockerdockerclient.Client, test testCase, dockerImage, contextDir, dockerfileName string, line int, finalOfSeveral bool) (dockerRef types.ImageReference, dockerLog []byte) {
+func buildUsingDocker(ctx context.Context, t *testing.T, client *docker.Client, mobyClient *mobyclient.Client, test testCase, dockerImage, contextDir, dockerfileName string, line int, finalOfSeveral bool) (dockerRef types.ImageReference, dockerLog []byte) {
 	// compute the path of the dockerfile relative to the build context
 	dockerfileRelativePath, err := filepath.Rel(contextDir, dockerfileName)
 	require.NoErrorf(t, err, "unable to compute path of dockerfile %q relative to context directory %q", dockerfileName, contextDir)
@@ -752,7 +768,7 @@ func buildUsingDocker(ctx context.Context, t *testing.T, client *docker.Client, 
 	if err != nil {
 		output.WriteString("\n" + err.Error())
 	}
-	if _, err := dockerClient.BuildCachePrune(ctx, dockerbuildtypes.CachePruneOptions{All: true}); err != nil {
+	if _, err := mobyClient.BuildCachePrune(ctx, mobyclient.BuildCachePruneOptions{All: true}); err != nil {
 		t.Logf("docker build cache prune: %v", err)
 	}
 
@@ -887,7 +903,7 @@ type FSTree struct {
 type Layer struct {
 	UncompressedDigest digest.Digest `json:"uncompressed-digest,omitempty"`
 	CompressedDigest   digest.Digest `json:"compressed-digest,omitempty"`
-	Headers            []FSHeader    `json:"-,omitempty"`
+	Headers            []FSHeader    `json:"-"`
 }
 
 // FSHeader is the parts of the tar.Header for an entry in a layer blob that
@@ -1343,10 +1359,10 @@ func compareJSON(a, b map[string]any, skip []string) (missKeys, leftKeys, diffKe
 func configCompareResult(miss, left, diff []string, notDocker string) string {
 	var buffer bytes.Buffer
 	if len(miss) > 0 {
-		buffer.WriteString(fmt.Sprintf("Fields missing from %s version: %s\n", notDocker, strings.Join(miss, " ")))
+		fmt.Fprintf(&buffer, "Fields missing from %s version: %s\n", notDocker, strings.Join(miss, " "))
 	}
 	if len(left) > 0 {
-		buffer.WriteString(fmt.Sprintf("Fields which only exist in %s version: %s\n", notDocker, strings.Join(left, " ")))
+		fmt.Fprintf(&buffer, "Fields which only exist in %s version: %s\n", notDocker, strings.Join(left, " "))
 	}
 	if len(diff) > 0 {
 		buffer.WriteString("Fields present in both versions have different values:\n")
@@ -1375,10 +1391,10 @@ func fsCompareResult(miss, left, diff []string, notDocker string) string {
 		return n
 	}
 	if len(miss) > 0 {
-		buffer.WriteString(fmt.Sprintf("Content missing from %s version: %s\n", notDocker, strings.Join(fixup(miss), " ")))
+		fmt.Fprintf(&buffer, "Content missing from %s version: %s\n", notDocker, strings.Join(fixup(miss), " "))
 	}
 	if len(left) > 0 {
-		buffer.WriteString(fmt.Sprintf("Content which only exists in %s version: %s\n", notDocker, strings.Join(fixup(left), " ")))
+		fmt.Fprintf(&buffer, "Content which only exists in %s version: %s\n", notDocker, strings.Join(fixup(left), " "))
 	}
 	if len(diff) > 0 {
 		buffer.WriteString("File attributes in both versions have different values:\n")
@@ -1424,7 +1440,9 @@ type (
 		compatLayerOmissions types.OptionalBool        // value to set for the buildah CompatLayerOmissions flag
 		transientMounts      []string                  // one possible buildah-specific feature
 		fsSkip               []string                  // expected filesystem differences, typically timestamps on files or directories we create or modify during the build and don't reset
-		buildArgs            map[string]string         // build args to supply, as if --build-arg was used
+
+		fsSkipCompatVolumesTrue []string          // more expected filesystem differences when compatVolumes=true
+		buildArgs               map[string]string // build args to supply, as if --build-arg was used
 	}
 )
 
@@ -3641,9 +3659,10 @@ var internalTestCases = []testCase{
 	},
 
 	{
-		name:             "chown-volume", // from podman #22530
-		contextDir:       "chown-volume",
-		testUsingVolumes: true,
+		name:                    "chown-volume", // from podman #22530
+		contextDir:              "chown-volume",
+		testUsingVolumes:        true,
+		fsSkipCompatVolumesTrue: []string{"(dir):volumea:mtime", "(dir):volumeb:mtime", "(dir):volumec:mtime"},
 	},
 
 	{
@@ -3721,6 +3740,13 @@ var internalTestCases = []testCase{
 		name:              "mount-targets-mount",
 		contextDir:        "mount-targets",
 		dockerfile:        "Dockerfile.mount",
+		dockerUseBuildKit: true,
+	},
+
+	{
+		name:              "quoted and inherited arg",
+		dockerfile:        "Dockerfile.quoted-arg",
+		fsSkip:            []string{"(dir):arg-expansion.txt:mtime"},
 		dockerUseBuildKit: true,
 	},
 }
@@ -3816,15 +3842,23 @@ func TestCommit(t *testing.T) {
 			description: "expose just config",
 			baseImage:   "mirror.gcr.io/busybox",
 			config: &docker.Config{
-				ExposedPorts: map[docker.Port]struct{}{"23456": {}},
+				ExposedPorts: map[docker.Port]struct{}{"23456/tcp": {}},
 			},
 		},
 		{
-			description: "expose union",
+			description: "expose union implicit",
 			baseImage:   "mirror.gcr.io/busybox",
 			changes:     []string{"EXPOSE 12345"},
 			config: &docker.Config{
-				ExposedPorts: map[docker.Port]struct{}{"23456": {}},
+				ExposedPorts: map[docker.Port]struct{}{"23456/tcp": {}},
+			},
+		},
+		{
+			description: "expose union explicit",
+			baseImage:   "mirror.gcr.io/busybox",
+			changes:     []string{"EXPOSE 12345/tcp"},
+			config: &docker.Config{
+				ExposedPorts: map[docker.Port]struct{}{"23456/tcp": {}},
 			},
 		},
 		{

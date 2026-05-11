@@ -73,6 +73,7 @@ type BudResults struct {
 	Format              string
 	From                string
 	Iidfile             string
+	IidfileRaw          string
 	InheritLabels       bool
 	InheritAnnotations  bool
 	Label               []string
@@ -129,6 +130,8 @@ type BudResults struct {
 	SourceDateEpoch     string
 	RewriteTimestamp    bool
 	CreatedAnnotation   bool
+	SourcePolicyFile    string
+	TransientRunMounts  []string
 }
 
 // FromAndBugResults represents the results for common flags
@@ -253,6 +256,7 @@ func GetBudFlags(flags *BudResults) pflag.FlagSet {
 	fs.StringSliceVarP(&flags.File, "file", "f", []string{}, "`pathname or URL` of a Dockerfile")
 	fs.StringVar(&flags.Format, "format", DefaultFormat(), "`format` of the built image's manifest and metadata. Use BUILDAH_FORMAT environment variable to override.")
 	fs.StringVar(&flags.Iidfile, "iidfile", "", "`file` to write the image ID to")
+	fs.StringVar(&flags.IidfileRaw, "iidfile-raw", "", "`file` to write the image ID to (without algorithm prefix)")
 	fs.IntVar(&flags.Jobs, "jobs", 1, "how many stages to run in parallel")
 	fs.StringArrayVar(&flags.Label, "label", []string{}, "set metadata for an image (default [])")
 	fs.StringArrayVar(&flags.LayerLabel, "layer-label", []string{}, "set metadata for an intermediate image (default [])")
@@ -298,6 +302,7 @@ newer:   only pull base and SBOM scanner images when newer images exist on the r
 	fs.BoolVar(&flags.Rm, "rm", true, "remove intermediate containers after a successful build")
 	// "runtime" definition moved to avoid name collision in podman build.  Defined in cmd/buildah/build.go.
 	fs.StringSliceVar(&flags.RuntimeFlags, "runtime-flag", []string{}, "add global flags for the container runtime")
+	fs.StringArrayVar(&flags.TransientRunMounts, "mount", []string{}, "set transient mounts for each RUN instruction, e.g. type=secret,id=mysecret")
 	fs.StringVar(&flags.SbomPreset, "sbom", "", "scan working container using `preset` configuration")
 	fs.StringVar(&flags.SbomScannerImage, "sbom-scanner-image", "", "scan working container using scanner command from `image`")
 	fs.StringArrayVar(&flags.SbomScannerCommand, "sbom-scanner-command", nil, "scan working container using `command` in scanner image")
@@ -312,6 +317,7 @@ newer:   only pull base and SBOM scanner images when newer images exist on the r
 	if err := fs.MarkHidden("signature-policy"); err != nil {
 		panic(fmt.Sprintf("error marking the signature-policy flag as hidden: %v", err))
 	}
+	fs.StringVar(&flags.SourcePolicyFile, "source-policy-file", "", "`pathname` of source policy file for controlling source references during build")
 	fs.BoolVar(&flags.SkipUnusedStages, "skip-unused-stages", true, "skips stages in multi-stage builds which do not affect the final target")
 	sourceDateEpochUsageDefault := ", defaults to current time"
 	if v := os.Getenv(internal.SourceDateEpochName); v != "" {
@@ -357,12 +363,14 @@ func GetBudFlagsCompletions() commonComp.FlagCompletions {
 	flagCompletion["hooks-dir"] = commonComp.AutocompleteNone
 	flagCompletion["ignorefile"] = commonComp.AutocompleteDefault
 	flagCompletion["iidfile"] = commonComp.AutocompleteDefault
+	flagCompletion["iidfile-raw"] = commonComp.AutocompleteDefault
 	flagCompletion["jobs"] = commonComp.AutocompleteNone
 	flagCompletion["label"] = commonComp.AutocompleteNone
 	flagCompletion["layer-label"] = commonComp.AutocompleteNone
 	flagCompletion["logfile"] = commonComp.AutocompleteDefault
 	flagCompletion["manifest"] = commonComp.AutocompleteDefault
 	flagCompletion["metadata-file"] = commonComp.AutocompleteDefault
+	flagCompletion["mount"] = commonComp.AutocompleteNone
 	flagCompletion["os"] = commonComp.AutocompleteNone
 	flagCompletion["os-feature"] = commonComp.AutocompleteNone
 	flagCompletion["os-version"] = commonComp.AutocompleteNone
@@ -380,6 +388,7 @@ func GetBudFlagsCompletions() commonComp.FlagCompletions {
 	flagCompletion["secret"] = commonComp.AutocompleteNone
 	flagCompletion["sign-by"] = commonComp.AutocompleteNone
 	flagCompletion["signature-policy"] = commonComp.AutocompleteNone
+	flagCompletion["source-policy-file"] = commonComp.AutocompleteDefault
 	flagCompletion["ssh"] = commonComp.AutocompleteNone
 	flagCompletion["source-date-epoch"] = commonComp.AutocompleteNone
 	flagCompletion["tag"] = commonComp.AutocompleteNone
@@ -545,6 +554,8 @@ func AliasFlags(_ *pflag.FlagSet, name string) pflag.NormalizedName {
 		name = "os"
 	case "purge":
 		name = "rm"
+	case "raw-iidfile":
+		name = "iidfile-raw"
 	case "tty":
 		name = "terminal"
 	}
